@@ -2,6 +2,7 @@
 
 In this example, you'll
 
+- Deploy a default-backend service (required for alb-ingress-controller)
 - Deploy an alb-ingress-controller
 - Create deployments and ingress resources in the cluster
 - Use [external-dns](https://github.com/kubernetes-incubator/external-dns) to create a DNS record
@@ -9,10 +10,16 @@ In this example, you'll
 
 # Deploy the alb-ingress-controller
 
+1. Deploy the default-backend service
+
+       ```
+       kubectl apply -f https://raw.githubusercontent.com/coreos/alb-ingress-controller/master/examples/default-backend.yaml
+       ```
+
 1. Download the example alb-ingress-manifest locally.
 
 	```
-	wget https://github.com/coreos/alb-ingress-controller/blob/master/examples/alb-ingress-controller.yaml
+	wget https://raw.githubusercontent.com/coreos/alb-ingress-controller/master/examples/alb-ingress-controller.yaml
 	```
 
 1. Edit the manifest and set the following attributes
@@ -24,7 +31,7 @@ In this example, you'll
 		  value: us-west-1
 		```
 
-	 - `CLUSTER_NAME`: name of the cluster. Must be under 11 characters and cannot contain `-`.
+	 - `CLUSTER_NAME`: name of the cluster. 
 
 		```yaml
 		- name: CLUSTER_NAME
@@ -75,7 +82,6 @@ In this example, you'll
 
 	```
 	$ kubectl apply -f https://raw.githubusercontent.com/coreos/alb-ingress-controller/master/examples/echoservice/echoserver-namespace.yaml &&\
-		kubectl apply -f https://raw.githubusercontent.com/coreos/alb-ingress-controller/master/examples/echoservice/echoserver-service.yaml &&\
 		kubectl apply -f https://raw.githubusercontent.com/coreos/alb-ingress-controller/master/examples/echoservice/echoserver-service.yaml &&\
 		kubectl apply -f https://raw.githubusercontent.com/coreos/alb-ingress-controller/master/examples/echoservice/echoserver-deployment.yaml &&\
 	```

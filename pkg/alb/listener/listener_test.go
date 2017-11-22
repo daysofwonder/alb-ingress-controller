@@ -5,6 +5,7 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	awselb "github.com/aws/aws-sdk-go/service/elbv2"
+	"github.com/coreos/alb-ingress-controller/pkg/annotations"
 	"github.com/coreos/alb-ingress-controller/pkg/aws/elbv2"
 	"github.com/coreos/alb-ingress-controller/pkg/util/log"
 	"github.com/coreos/alb-ingress-controller/pkg/util/types"
@@ -72,7 +73,7 @@ func setup() {
 func TestNewHTTPListener(t *testing.T) {
 	desiredPort := int64(newPort)
 	o := &NewDesiredListenerOptions{
-		Port:   desiredPort,
+		Port:   annotations.PortData{desiredPort, "HTTP"},
 		Logger: logr,
 	}
 
@@ -96,7 +97,7 @@ func TestNewHTTPSListener(t *testing.T) {
 	desiredPort := int64(443)
 	desiredCertArn := aws.String("abc123")
 	o := &NewDesiredListenerOptions{
-		Port:           desiredPort,
+		Port:           annotations.PortData{desiredPort, "HTTPS"},
 		CertificateArn: desiredCertArn,
 		Logger:         logr,
 	}
@@ -160,7 +161,7 @@ func mockEventf(a, b, c string, d ...interface{}) {
 func TestReconcileCreate(t *testing.T) {
 	setup()
 	l := Listener{
-		logger:  logr,
+		Logger:  logr,
 		Desired: mockList1,
 	}
 
@@ -181,7 +182,7 @@ func TestReconcileDelete(t *testing.T) {
 	elbv2.ELBV2svc = mockELBV2Client{}
 
 	l := Listener{
-		logger:  logr,
+		Logger:  logr,
 		Current: mockList1,
 	}
 
@@ -198,7 +199,7 @@ func TestReconcileDelete(t *testing.T) {
 func TestReconcileModifyPortChange(t *testing.T) {
 	setup()
 	l := Listener{
-		logger:  logr,
+		Logger:  logr,
 		Desired: mockList2,
 		Current: mockList1,
 	}
@@ -219,7 +220,7 @@ func TestReconcileModifyPortChange(t *testing.T) {
 func TestReconcileModifyNoChange(t *testing.T) {
 	setup()
 	l := Listener{
-		logger:  logr,
+		Logger:  logr,
 		Desired: mockList2,
 		Current: mockList1,
 	}
@@ -236,33 +237,33 @@ func TestReconcileModifyNoChange(t *testing.T) {
 func TestModificationNeeds(t *testing.T) {
 	setup()
 	lPortNeedsMod := Listener{
-		logger:  logr,
+		Logger:  logr,
 		Desired: mockList2,
 		Current: mockList1,
 	}
 
-	if !lPortNeedsMod.NeedsModification(lPortNeedsMod.Desired) {
+	if !lPortNeedsMod.NeedsModificationCheck(lPortNeedsMod.Desired) {
 		t.Error("Listener reported no modification needed. Ports were different and should" +
 			"require modification")
 	}
 
 	lNoMod := Listener{
-		logger:  logr,
+		Logger:  logr,
 		Desired: mockList1,
 		Current: mockList1,
 	}
 
-	if lNoMod.NeedsModification(lNoMod.Desired) {
+	if lNoMod.NeedsModificationCheck(lNoMod.Desired) {
 		t.Error("Listener reported modification needed. Desired and Current were the same")
 	}
 
 	lCertNeedsMod := Listener{
-		logger:  logr,
+		Logger:  logr,
 		Desired: mockList3,
 		Current: mockList1,
 	}
 
-	if !lCertNeedsMod.NeedsModification(lCertNeedsMod.Desired) {
+	if !lCertNeedsMod.NeedsModificationCheck(lCertNeedsMod.Desired) {
 		t.Error("Listener reported no modification needed. Certificates were different and" +
 			"should require modification")
 	}

@@ -33,6 +33,7 @@ type ALBIngress struct {
 	namespace             string
 	ingressName           string
 	clusterName           string
+	albNamePrefix         string
 	recorder              record.EventRecorder
 	ingress               *extensions.Ingress
 	lock                  *sync.Mutex
@@ -45,11 +46,13 @@ type ALBIngress struct {
 }
 
 type NewALBIngressOptions struct {
-	Namespace   string
-	Name        string
-	ClusterName string
-	Ingress     *extensions.Ingress
-	Recorder    record.EventRecorder
+	Namespace     string
+	Name          string
+	ClusterName   string
+	ALBNamePrefix string
+	Ingress       *extensions.Ingress
+	Recorder      record.EventRecorder
+	Reconciled    bool
 }
 
 // ID returns an ingress id based off of a namespace and name
@@ -63,23 +66,28 @@ func ID(namespace, name string) string {
 func NewALBIngress(o *NewALBIngressOptions) *ALBIngress {
 	ingressID := ID(o.Namespace, o.Name)
 	return &ALBIngress{
-		ID:          ingressID,
-		namespace:   o.Namespace,
-		clusterName: o.ClusterName,
-		ingressName: o.Name,
-		lock:        new(sync.Mutex),
-		logger:      log.New(ingressID),
-		recorder:    o.Recorder,
+		ID:            ingressID,
+		namespace:     o.Namespace,
+		clusterName:   o.ClusterName,
+		albNamePrefix: o.ALBNamePrefix,
+		ingressName:   o.Name,
+		lock:          new(sync.Mutex),
+		logger:        log.New(ingressID),
+		recorder:      o.Recorder,
+		Reconciled:    o.Reconciled,
+		ingress:       o.Ingress,
 	}
 }
 
 type NewALBIngressFromIngressOptions struct {
-	Ingress            *extensions.Ingress
-	ExistingIngress    *ALBIngress
-	ClusterName        string
-	GetServiceNodePort func(string, int32) (*int64, error)
-	GetNodes           func() util.AWSStringSlice
-	Recorder           record.EventRecorder
+	Ingress               *extensions.Ingress
+	ExistingIngress       *ALBIngress
+	ClusterName           string
+	ALBNamePrefix         string
+	GetServiceNodePort    func(string, int32) (*int64, error)
+	GetNodes              func() util.AWSStringSlice
+	Recorder              record.EventRecorder
+	ConnectionIdleTimeout int64
 }
 
 // NewALBIngressFromIngress builds ALBIngress's based off of an Ingress object
@@ -91,11 +99,12 @@ func NewALBIngressFromIngress(o *NewALBIngressFromIngressOptions) *ALBIngress {
 
 	// Create newIngress ALBIngress object holding the resource details and some cluster information.
 	newIngress := NewALBIngress(&NewALBIngressOptions{
-		Namespace:   o.Ingress.GetNamespace(),
-		Name:        o.Ingress.Name,
-		ClusterName: o.ClusterName,
-		Recorder:    o.Recorder,
-		Ingress:     o.Ingress,
+		Namespace:     o.Ingress.GetNamespace(),
+		Name:          o.Ingress.Name,
+		ClusterName:   o.ClusterName,
+		ALBNamePrefix: o.ALBNamePrefix,
+		Recorder:      o.Recorder,
+		Ingress:       o.Ingress,
 	})
 
 	if o.ExistingIngress != nil {
@@ -104,6 +113,8 @@ func NewALBIngressFromIngress(o *NewALBIngressFromIngressOptions) *ALBIngress {
 		newIngress = o.ExistingIngress
 		newIngress.lock.Lock()
 		defer newIngress.lock.Unlock()
+		// reattach k8s ingress as if assembly happened through aws sync, it may be missing.
+		newIngress.ingress = o.Ingress
 		// Ensure all desired state is removed from the copied ingress. The desired state of each
 		// component will be generated later in this function.
 		newIngress.StripDesiredState()
@@ -111,7 +122,7 @@ func NewALBIngressFromIngress(o *NewALBIngressFromIngressOptions) *ALBIngress {
 	}
 
 	// Load up the ingress with our current annotations.
-	newIngress.annotations, err = annotations.ParseAnnotations(o.Ingress.Annotations, newIngress.clusterName)
+	newIngress.annotations, err = annotations.ParseAnnotations(o.Ingress.Annotations, o.ClusterName)
 	if err != nil {
 		msg := fmt.Sprintf("Error parsing annotations: %s", err.Error())
 		newIngress.Reconciled = false
@@ -131,7 +142,7 @@ func NewALBIngressFromIngress(o *NewALBIngressFromIngressOptions) *ALBIngress {
 
 	// Assemble the load balancer
 	newIngress.LoadBalancer = loadbalancer.NewDesiredLoadBalancer(&loadbalancer.NewDesiredLoadBalancerOptions{
-		ClusterName:          o.ClusterName,
+		ALBNamePrefix:        o.ALBNamePrefix,
 		Namespace:            o.Ingress.GetNamespace(),
 		ExistingLoadBalancer: newIngress.LoadBalancer,
 		IngressName:          o.Ingress.Name,
@@ -146,7 +157,7 @@ func NewALBIngressFromIngress(o *NewALBIngressFromIngressOptions) *ALBIngress {
 		LoadBalancerID:       newIngress.LoadBalancer.ID,
 		ExistingTargetGroups: newIngress.LoadBalancer.TargetGroups,
 		Annotations:          newIngress.annotations,
-		ClusterName:          o.ClusterName,
+		ALBNamePrefix:        o.ALBNamePrefix,
 		Namespace:            o.Ingress.GetNamespace(),
 		Tags:                 newIngress.Tags(),
 		Logger:               newIngress.logger,
@@ -181,12 +192,13 @@ func NewALBIngressFromIngress(o *NewALBIngressFromIngressOptions) *ALBIngress {
 }
 
 type NewALBIngressFromAWSLoadBalancerOptions struct {
-	LoadBalancer      *elbv2.LoadBalancer
-	ClusterName       string
-	Recorder          record.EventRecorder
-	ManagedSG         *string
-	ManagedSGPorts    []int64
-	ManagedInstanceSG *string
+	LoadBalancer          *elbv2.LoadBalancer
+	ALBNamePrefix         string
+	Recorder              record.EventRecorder
+	ManagedSG             *string
+	ManagedSGPorts        []int64
+	ManagedInstanceSG     *string
+	ConnectionIdleTimeout int64
 }
 
 // NewALBIngressFromAWSLoadBalancer builds ALBIngress's based off of an elbv2.LoadBalancer
@@ -209,21 +221,23 @@ func NewALBIngressFromAWSLoadBalancer(o *NewALBIngressFromAWSLoadBalancerOptions
 
 	// Assemble ingress
 	ingress := NewALBIngress(&NewALBIngressOptions{
-		Namespace:   namespace,
-		Name:        ingressName,
-		ClusterName: o.ClusterName,
-		Recorder:    o.Recorder,
+		Namespace:     namespace,
+		Name:          ingressName,
+		ALBNamePrefix: o.ALBNamePrefix,
+		Recorder:      o.Recorder,
+		Reconciled:    true,
 	})
 
 	// Assemble load balancer
 	ingress.LoadBalancer, err = loadbalancer.NewCurrentLoadBalancer(&loadbalancer.NewCurrentLoadBalancerOptions{
-		LoadBalancer:      o.LoadBalancer,
-		Tags:              tags,
-		ClusterName:       o.ClusterName,
-		Logger:            ingress.logger,
-		ManagedSG:         o.ManagedSG,
-		ManagedSGPorts:    o.ManagedSGPorts,
-		ManagedInstanceSG: o.ManagedInstanceSG,
+		LoadBalancer:          o.LoadBalancer,
+		Tags:                  tags,
+		ALBNamePrefix:         o.ALBNamePrefix,
+		Logger:                ingress.logger,
+		ManagedSG:             o.ManagedSG,
+		ManagedSGPorts:        o.ManagedSGPorts,
+		ManagedInstanceSG:     o.ManagedInstanceSG,
+		ConnectionIdleTimeout: o.ConnectionIdleTimeout,
 	})
 	if err != nil {
 		return nil, err
@@ -237,7 +251,7 @@ func NewALBIngressFromAWSLoadBalancer(o *NewALBIngressFromAWSLoadBalancerOptions
 
 	ingress.LoadBalancer.TargetGroups, err = targetgroups.NewCurrentTargetGroups(&targetgroups.NewCurrentTargetGroupsOptions{
 		TargetGroups:   targetGroups,
-		ClusterName:    o.ClusterName,
+		ALBNamePrefix:  o.ALBNamePrefix,
 		LoadBalancerID: ingress.LoadBalancer.ID,
 		Logger:         ingress.logger,
 	})
@@ -252,8 +266,9 @@ func NewALBIngressFromAWSLoadBalancer(o *NewALBIngressFromAWSLoadBalancerOptions
 	}
 
 	ingress.LoadBalancer.Listeners, err = listeners.NewCurrentListeners(&listeners.NewCurrentListenersOptions{
-		Listeners: ls,
-		Logger:    ingress.logger,
+		TargetGroups: &ingress.LoadBalancer.TargetGroups,
+		Listeners:    ls,
+		Logger:       ingress.logger,
 	})
 	if err != nil {
 		return nil, err
@@ -290,6 +305,7 @@ func (a *ALBIngress) Hostnames() ([]api.LoadBalancerIngress, error) {
 		return nil, fmt.Errorf("No ALB hostnames for ingress")
 	}
 
+	a.logger.Debugf("Ingress library requested hostname list and we returned %s", *a.LoadBalancer.Current.DNSName)
 	return hostnames, nil
 }
 

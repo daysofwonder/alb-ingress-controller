@@ -26,6 +26,7 @@ const (
 	backendProtocolKey            = "alb.ingress.kubernetes.io/backend-protocol"
 	certificateArnKey             = "alb.ingress.kubernetes.io/certificate-arn"
 	wafAclIdKey                   = "alb.ingress.kubernetes.io/waf-acl-id"
+	connectionIdleTimeoutKey      = "alb.ingress.kubernetes.io/connection-idle-timeout"
 	healthcheckIntervalSecondsKey = "alb.ingress.kubernetes.io/healthcheck-interval-seconds"
 	healthcheckPathKey            = "alb.ingress.kubernetes.io/healthcheck-path"
 	healthcheckPortKey            = "alb.ingress.kubernetes.io/healthcheck-port"
@@ -50,6 +51,7 @@ type Annotations struct {
 	BackendProtocol            *string
 	CertificateArn             *string
 	WafAclId                   *string
+	ConnectionIdleTimeout      int64
 	HealthcheckIntervalSeconds *int64
 	HealthcheckPath            *string
 	HealthcheckPort            *string
@@ -57,13 +59,18 @@ type Annotations struct {
 	HealthcheckTimeoutSeconds  *int64
 	HealthyThresholdCount      *int64
 	UnhealthyThresholdCount    *int64
-	Ports                      []int64
+	Ports                      []PortData
 	Scheme                     *string
 	SecurityGroups             util.AWSStringSlice
 	Subnets                    util.Subnets
 	SuccessCodes               *string
 	Tags                       []*elbv2.Tag
 	VPCID                      *string
+}
+
+type PortData struct {
+	Port   int64
+	Scheme string
 }
 
 // ParseAnnotations validates and loads all the annotations provided into the Annotations struct.
@@ -85,6 +92,7 @@ func ParseAnnotations(annotations map[string]string, clusterName string) (*Annot
 	a := new(Annotations)
 	for _, err := range []error{
 		a.setBackendProtocol(annotations),
+		a.setConnectionIdleTimeout(annotations),
 		a.setCertificateArn(annotations),
 		a.setHealthcheckIntervalSeconds(annotations),
 		a.setHealthcheckPath(annotations),
@@ -128,6 +136,22 @@ func (a *Annotations) setCertificateArn(annotations map[string]string) error {
 			cache.Set(cert, "success", 30*time.Minute)
 		}
 	}
+	return nil
+}
+
+func (a *Annotations) setConnectionIdleTimeout(annotations map[string]string) error {
+	i, err := strconv.ParseInt(annotations[connectionIdleTimeoutKey], 10, 64)
+	if err != nil {
+		if annotations[connectionIdleTimeoutKey] != "" {
+			return err
+		}
+		return nil
+	}
+	// aws only accepts a range of 1-3600 seconds
+	if i < 1 || i > 3600 {
+		return fmt.Errorf("Invalid connection idle timeout provided must be within 1-3600 seconds. Was: %d", i)
+	}
+	a.ConnectionIdleTimeout = i
 	return nil
 }
 
@@ -180,6 +204,11 @@ func (a *Annotations) setHealthcheckTimeoutSeconds(annotations map[string]string
 		a.HealthcheckTimeoutSeconds = aws.Int64(5)
 		return nil
 	}
+	// If interval is set at our above timeout, AWS will reject targetgroup creation
+	if i >= *a.HealthcheckIntervalSeconds {
+		return fmt.Errorf("Healthcheck timeout must be less than healthcheck interval. Timeout was: %d. Interval was %d.",
+			i, *a.HealthcheckIntervalSeconds)
+	}
 	a.HealthcheckTimeoutSeconds = &i
 	return nil
 }
@@ -214,14 +243,14 @@ func (a *Annotations) setUnhealthyThresholdCount(annotations map[string]string) 
 // is empty, implying the annotation was not present, desired ports are set to the default. The
 // default port value is 80 when a certArn is not present and 443 when it is.
 func (a *Annotations) setPorts(annotations map[string]string) error {
-	lps := []int64{}
+	lps := []PortData{}
 	// If port data is empty, default to port 80 or 443 contingent on whether a certArn was specified.
 	if annotations[portKey] == "" {
 		switch annotations[certificateArnKey] {
 		case "":
-			lps = append(lps, int64(80))
+			lps = append(lps, PortData{int64(80), "HTTP"})
 		default:
-			lps = append(lps, int64(443))
+			lps = append(lps, PortData{int64(443), "HTTPS"})
 		}
 		a.Ports = lps
 		return nil
@@ -245,9 +274,9 @@ func (a *Annotations) setPorts(annotations map[string]string) error {
 			}
 			switch {
 			case k == "HTTP":
-				lps = append(lps, v)
+				lps = append(lps, PortData{v, k})
 			case k == "HTTPS":
-				lps = append(lps, v)
+				lps = append(lps, PortData{v, k})
 			default:
 				return fmt.Errorf("Invalid protocol provided. Must be HTTP or HTTPS and in order to use HTTPS you must have specified a certificate ARN")
 			}
@@ -272,7 +301,7 @@ func (a *Annotations) setScheme(annotations map[string]string) error {
 func (a *Annotations) setSecurityGroups(annotations map[string]string) error {
 	// no security groups specified means controller should manage them, if so return and sg will be
 	// created and managed during reconcile.
-	if len(a.SecurityGroups) == 0 {
+	if _, ok := annotations[securityGroupsKey]; !ok {
 		return nil
 	}
 	var names []*string
@@ -379,7 +408,7 @@ func (a *Annotations) setSubnets(annotations map[string]string, clusterName stri
 		if len(useableSubnets) < 2 {
 			return fmt.Errorf("Retrieval of subnets failed to resolve 2 qualified subnets. Subnets must "+
 				"contain the %s/%s tag with a value of %s and the %s tag signifying it should be used for ALBs "+
-				"Additionally, their must be at least 2 subnets with unique availability zones as required by "+
+				"Additionally, there must be at least 2 subnets with unique availability zones as required by "+
 				"ALBs. Either tag subnets to meet this requirement or use the subnets annotation on the "+
 				"ingress resource to explicitly call out what subnets to use for ALB creation. The subnets "+
 				"that did resolve were %v.", clusterTagKey, clusterName, clusterTagValue, albRoleTagKey,

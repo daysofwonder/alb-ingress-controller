@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -40,6 +41,7 @@ type ALBController struct {
 	recorder        record.EventRecorder
 	ALBIngresses    albingresses.ALBIngresses
 	clusterName     string
+	albNamePrefix   string
 	IngressClass    string
 	lastUpdate      time.Time
 	albSyncInterval time.Duration
@@ -47,6 +49,9 @@ type ALBController struct {
 }
 
 var logger *log.Logger
+
+var release = "1.0.0"
+var build = "git-00000000"
 
 func init() {
 	logger = log.New("controller")
@@ -68,21 +73,27 @@ func NewALBController(awsconfig *aws.Config, conf *config.Config) *ALBController
 // Configure sets up the ingress controller based on the configuration provided in the manifest.
 // Additionally, it calls the ingress assembly from AWS.
 func (ac *ALBController) Configure(ic *controller.GenericController) {
+	var err error
 	ac.IngressClass = ic.IngressClass()
+	ac.albNamePrefix, err = cleanClusterName(ac.clusterName)
+	if err != nil {
+		logger.Exitf("Failed to generate an ALB prefix for naming. Error: %s", err.Error())
+	}
+
 	if ac.IngressClass != "" {
 		logger.Infof("Ingress class set to %s", ac.IngressClass)
 	}
 
-	if len(ac.clusterName) > 11 {
-		logger.Exitf("Cluster name must be 11 characters or less")
+	if len(ac.albNamePrefix) > 11 {
+		logger.Exitf("ALB name prefix must be 11 characters or less")
 	}
 
 	if ac.clusterName == "" {
 		logger.Exitf("A cluster name must be defined")
 	}
 
-	if strings.Contains(ac.clusterName, "-") {
-		logger.Exitf("Cluster name cannot contain '-'")
+	if strings.Contains(ac.albNamePrefix, "-") {
+		logger.Exitf("ALB name prefix cannot contain '-'")
 	}
 
 	ac.recorder = ic.GetRecorder()
@@ -95,9 +106,9 @@ func (ac *ALBController) Configure(ic *controller.GenericController) {
 
 func (ac *ALBController) startPolling() {
 	for {
-		time.Sleep(60 * time.Second)
-		if ac.lastUpdate.Add(180 * time.Second).Before(time.Now()) {
-			logger.Debugf("Forcing ingress update as update hasn't occured in 3 minutes.")
+		time.Sleep(10 * time.Second)
+		if ac.lastUpdate.Add(60 * time.Second).Before(time.Now()) {
+			logger.Infof("Ingress update being attempted. (Forced from no event seen in 60 seconds).")
 			ac.update()
 		}
 	}
@@ -106,7 +117,7 @@ func (ac *ALBController) startPolling() {
 func (ac *ALBController) syncALBs() {
 	for {
 		time.Sleep(ac.albSyncInterval)
-		logger.Debugf("ALB sync interval %s elapsed; assembling ingresses..", ac.albSyncInterval)
+		logger.Debugf("ALB sync interval %s elapsed; Assembly will be reattempted once lock is available..", ac.albSyncInterval)
 		ac.syncALBsWithAWS()
 	}
 }
@@ -114,9 +125,10 @@ func (ac *ALBController) syncALBs() {
 func (ac *ALBController) syncALBsWithAWS() {
 	ac.mutex.Lock()
 	defer ac.mutex.Unlock()
+	logger.Debugf("Lock was available. Attempting sync")
 	ac.ALBIngresses = albingresses.AssembleIngressesFromAWS(&albingresses.AssembleIngressesFromAWSOptions{
-		Recorder:    ac.recorder,
-		ClusterName: ac.clusterName,
+		Recorder:      ac.recorder,
+		ALBNamePrefix: ac.albNamePrefix,
 	})
 }
 
@@ -131,7 +143,6 @@ func (ac *ALBController) OnUpdate(ingress.Configuration) error {
 }
 
 func (ac *ALBController) update() {
-
 	ac.mutex.Lock()
 	defer ac.mutex.Unlock()
 
@@ -141,6 +152,7 @@ func (ac *ALBController) update() {
 	newIngresses := albingresses.NewALBIngressesFromIngresses(&albingresses.NewALBIngressesFromIngressesOptions{
 		Recorder:            ac.recorder,
 		ClusterName:         ac.clusterName,
+		ALBNamePrefix:       ac.albNamePrefix,
 		Ingresses:           ac.storeLister.Ingress.List(),
 		ALBIngresses:        ac.ALBIngresses,
 		IngressClass:        ac.IngressClass,
@@ -169,6 +181,14 @@ func (ac *ALBController) update() {
 		}(&wg, ingress)
 	}
 	wg.Wait()
+
+	// clean up all deleted ingresses from the list
+	for _, ingress := range ac.ALBIngresses {
+		if ingress.LoadBalancer != nil && ingress.LoadBalancer.Deleted {
+			i, _ := ac.ALBIngresses.FindByID(ingress.ID)
+			ac.ALBIngresses = append(ac.ALBIngresses[:i], ac.ALBIngresses[i+1:]...)
+		}
+	}
 }
 
 // OverrideFlags configures optional override flags for the ingress controller
@@ -215,8 +235,8 @@ func (ac *ALBController) DefaultIngressClass() string {
 func (ac *ALBController) Info() *ingress.BackendInfo {
 	return &ingress.BackendInfo{
 		Name:       "ALB Ingress Controller",
-		Release:    "1.0.0",
-		Build:      "git-00000000",
+		Release:    release,
+		Build:      build,
 		Repository: "git://github.com/coreos/alb-ingress-controller",
 	}
 }
@@ -244,17 +264,59 @@ func (ac *ALBController) StateHandler(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(ac.ALBIngresses)
 }
 
+func (ac *ALBController) collectChecks(checks map[string]func() error, resultsOut map[string]string, statusOut *int) {
+	ac.mutex.RLock()
+	defer ac.mutex.RUnlock()
+	for name, check := range checks {
+		if err := check(); err != nil {
+			*statusOut = http.StatusServiceUnavailable
+			resultsOut[name] = err.Error()
+		} else {
+			resultsOut[name] = "OK"
+		}
+	}
+}
+
+// StatusHandler validates basic connectivity to the AWS APIs.
+func (ac *ALBController) StatusHandler(w http.ResponseWriter, r *http.Request) {
+	checks := make(map[string]func() error)
+	checks["acm"] = acm.ACMsvc.Status()
+	checks["ec2"] = ec2.EC2svc.Status()
+	checks["elbv2"] = elbv2.ELBV2svc.Status()
+	checks["iam"] = iam.IAMsvc.Status()
+	checkResults := make(map[string]string)
+
+	status := http.StatusOK
+	ac.collectChecks(checks, checkResults, &status)
+
+	// write out the response code and content type header
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+
+	// unless ?full=1, return an empty body. Kubernetes only cares about the
+	// HTTP status code, so we won't waste bytes on the full body.
+	if r.URL.Query().Get("full") != "1" {
+		w.Write([]byte("{}\n"))
+		return
+	}
+
+	// otherwise, write the JSON body ignoring any encoding errors (which
+	// shouldn't really be possible since we're encoding a map[string]string).
+	encoder := json.NewEncoder(w)
+	encoder.SetIndent("", "    ")
+	encoder.Encode(checkResults)
+}
+
 // UpdateIngressStatus returns the hostnames for the ALB.
 func (ac *ALBController) UpdateIngressStatus(ing *extensions.Ingress) []api.LoadBalancerIngress {
+	//ac.mutex.RLock()
+	//defer ac.mutex.RUnlock()
 	ingress := albingress.NewALBIngress(&albingress.NewALBIngressOptions{
 		Namespace:   ing.ObjectMeta.Namespace,
 		Name:        ing.ObjectMeta.Name,
 		ClusterName: ac.clusterName,
 		Recorder:    ac.recorder,
 	})
-
-	ac.mutex.RLock()
-	defer ac.mutex.RUnlock()
 
 	if _, i := ac.ALBIngresses.FindByID(ingress.ID); i != nil {
 		hostnames, err := i.Hostnames()
@@ -265,7 +327,7 @@ func (ac *ALBController) UpdateIngressStatus(ing *extensions.Ingress) []api.Load
 		}
 	}
 
-	return nil
+	return []api.LoadBalancerIngress{}
 }
 
 // GetServiceNodePort returns the nodeport for a given Kubernetes service
@@ -309,4 +371,16 @@ func (ac *ALBController) GetNodes() util.AWSStringSlice {
 	}
 	sort.Sort(result)
 	return result
+}
+
+func cleanClusterName(cn string) (string, error) {
+	reg, err := regexp.Compile("[^a-zA-Z0-9]+")
+	if err != nil {
+		return "", err
+	}
+	n := reg.ReplaceAllString(cn, "")
+	if len(n) > 11 {
+		n = n[:11]
+	}
+	return n, nil
 }

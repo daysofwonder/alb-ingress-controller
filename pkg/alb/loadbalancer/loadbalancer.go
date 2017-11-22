@@ -10,8 +10,10 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/elbv2"
 	"github.com/coreos/alb-ingress-controller/pkg/alb/listeners"
+	"github.com/coreos/alb-ingress-controller/pkg/alb/targetgroup"
 	"github.com/coreos/alb-ingress-controller/pkg/alb/targetgroups"
 	"github.com/coreos/alb-ingress-controller/pkg/alb/wafacl"
 	"github.com/coreos/alb-ingress-controller/pkg/annotations"
@@ -29,6 +31,8 @@ type LoadBalancer struct {
 	Desired                  *elbv2.LoadBalancer // desired version of load balancer in AWS
 	TargetGroups             targetgroups.TargetGroups
 	Listeners                listeners.Listeners
+	DesiredIdleTimeout       int64
+	CurrentIdleTimeout       int64
 	CurrentTags              util.Tags
 	DesiredTags              util.Tags
 	CurrentPorts             portList
@@ -51,10 +55,11 @@ const (
 	tagsModified
 	schemeModified
 	managedSecurityGroupsModified
+	connectionIdleTimeoutModified
 )
 
 type NewDesiredLoadBalancerOptions struct {
-	ClusterName          string
+	ALBNamePrefix        string
 	Namespace            string
 	IngressName          string
 	ExistingLoadBalancer *LoadBalancer
@@ -73,11 +78,12 @@ func (a portList) Less(i, j int) bool { return a[i] < a[j] }
 func NewDesiredLoadBalancer(o *NewDesiredLoadBalancerOptions) *LoadBalancer {
 	// TODO: LB name  must contain only alphanumeric characters or hyphens, and must
 	// not begin or end with a hyphen.
-	name := createLBName(o.Namespace, o.IngressName, o.ClusterName)
+	name := createLBName(o.Namespace, o.IngressName, o.ALBNamePrefix)
 
 	newLoadBalancer := &LoadBalancer{
-		ID:          name,
-		DesiredTags: o.Tags,
+		ID:                 name,
+		DesiredTags:        o.Tags,
+		DesiredIdleTimeout: o.Annotations.ConnectionIdleTimeout,
 		Desired: &elbv2.LoadBalancer{
 			AvailabilityZones: o.Annotations.Subnets.AsAvailabilityZones(),
 			LoadBalancerName:  aws.String(name),
@@ -88,8 +94,12 @@ func NewDesiredLoadBalancer(o *NewDesiredLoadBalancerOptions) *LoadBalancer {
 		logger: o.Logger,
 	}
 
+	lsps := portList{}
+	for _, port := range o.Annotations.Ports {
+		lsps = append(lsps, port.Port)
+	}
 	if len(newLoadBalancer.Desired.SecurityGroups) == 0 {
-		newLoadBalancer.DesiredPorts = o.Annotations.Ports
+		newLoadBalancer.DesiredPorts = lsps
 	}
 
 	// TODO: What is this for??
@@ -97,8 +107,9 @@ func NewDesiredLoadBalancer(o *NewDesiredLoadBalancerOptions) *LoadBalancer {
 		// we had an existing LoadBalancer in ingress, so just copy the desired state over
 		o.ExistingLoadBalancer.Desired = newLoadBalancer.Desired
 		o.ExistingLoadBalancer.DesiredTags = newLoadBalancer.DesiredTags
+		o.ExistingLoadBalancer.DesiredIdleTimeout = newLoadBalancer.DesiredIdleTimeout
 		if len(o.ExistingLoadBalancer.Desired.SecurityGroups) == 0 {
-			o.ExistingLoadBalancer.DesiredPorts = o.Annotations.Ports
+			o.ExistingLoadBalancer.DesiredPorts = lsps
 		}
 		return o.ExistingLoadBalancer
 	}
@@ -108,13 +119,14 @@ func NewDesiredLoadBalancer(o *NewDesiredLoadBalancerOptions) *LoadBalancer {
 }
 
 type NewCurrentLoadBalancerOptions struct {
-	LoadBalancer      *elbv2.LoadBalancer
-	Tags              util.Tags
-	ClusterName       string
-	Logger            *log.Logger
-	ManagedSG         *string
-	ManagedInstanceSG *string
-	ManagedSGPorts    []int64
+	LoadBalancer          *elbv2.LoadBalancer
+	Tags                  util.Tags
+	ALBNamePrefix         string
+	Logger                *log.Logger
+	ManagedSG             *string
+	ManagedInstanceSG     *string
+	ManagedSGPorts        []int64
+	ConnectionIdleTimeout int64
 }
 
 // NewCurrentLoadBalancer returns a new loadbalancer.LoadBalancer based on an elbv2.LoadBalancer.
@@ -129,7 +141,7 @@ func NewCurrentLoadBalancer(o *NewCurrentLoadBalancerOptions) (*LoadBalancer, er
 		return nil, fmt.Errorf("The LoadBalancer %s does not have a Namespace tag, can't import", *o.LoadBalancer.LoadBalancerName)
 	}
 
-	name := createLBName(namespace, ingressName, o.ClusterName)
+	name := createLBName(namespace, ingressName, o.ALBNamePrefix)
 	if name != *o.LoadBalancer.LoadBalancerName {
 		return nil, fmt.Errorf("Loadbalancer does not have expected (calculated) name. "+
 			"Expecting %s but was %s.", name, *o.LoadBalancer.LoadBalancerName)
@@ -143,6 +155,7 @@ func NewCurrentLoadBalancer(o *NewCurrentLoadBalancerOptions) (*LoadBalancer, er
 		CurrentManagedSG:         o.ManagedSG,
 		CurrentPorts:             o.ManagedSGPorts,
 		CurrentManagedInstanceSG: o.ManagedInstanceSG,
+		CurrentIdleTimeout:       o.ConnectionIdleTimeout,
 	}, nil
 }
 
@@ -190,6 +203,7 @@ func (lb *LoadBalancer) Reconcile(rOpts *ReconcileOptions) []error {
 			errors = append(errors, err)
 			break
 		}
+		lb.logger.Infof("Completed ELBV2 (ALB) modification.")
 	}
 
 	tgsOpts := &targetgroups.ReconcileOptions{
@@ -197,8 +211,11 @@ func (lb *LoadBalancer) Reconcile(rOpts *ReconcileOptions) []error {
 		VpcID:             lb.Current.VpcId,
 		ManagedSGInstance: lb.CurrentManagedInstanceSG,
 	}
-	if tgs, err := lb.TargetGroups.Reconcile(tgsOpts); err != nil {
+
+	tgs, cleanUp, err := lb.TargetGroups.Reconcile(tgsOpts)
+	if err != nil {
 		errors = append(errors, err)
+		return errors
 	} else {
 		lb.TargetGroups = tgs
 	}
@@ -212,6 +229,37 @@ func (lb *LoadBalancer) Reconcile(rOpts *ReconcileOptions) []error {
 		errors = append(errors, err)
 	} else {
 		lb.Listeners = ltnrs
+	}
+
+	for _, l := range lb.Listeners {
+		if l.Deleted {
+			i := lb.Listeners.Find(l.Current)
+			lb.Listeners = append(lb.Listeners[:i], lb.Listeners[i+1:]...)
+		}
+	}
+
+	// Return now if listeners are already deleted, signifies has already been destructed and
+	// TG clean-up, based on rules below does not need to occur.
+	if len(lb.Listeners) < 1 {
+		for _, tg := range cleanUp {
+			if err := targetgroup.DeleteTG(tg); err != nil {
+				errors = append(errors, err)
+				return errors
+			}
+			index, _ := lb.TargetGroups.FindById(tg.ID)
+			lb.TargetGroups = append(lb.TargetGroups[:index], lb.TargetGroups[index+1:]...)
+		}
+		return errors
+	}
+
+	unusedTGs := lb.Listeners[0].Rules.FindUnusedTGs(lb.TargetGroups)
+	for _, tg := range unusedTGs {
+		if err := targetgroup.DeleteTG(tg); err != nil {
+			errors = append(errors, err)
+			return errors
+		}
+		index, _ := lb.TargetGroups.FindById(tg.ID)
+		lb.TargetGroups = append(lb.TargetGroups[:index], lb.TargetGroups[index+1:]...)
 	}
 
 	return errors
@@ -296,7 +344,21 @@ func (lb *LoadBalancer) create(rOpts *ReconcileOptions) error {
 		return err
 	}
 
+	// lb created. set to current
 	lb.Current = o.LoadBalancers[0]
+
+	// DesiredIdleTimeout is 0 when no annotation was set, thus no modification should be attempted
+	// this will result in using the AWS default
+	if lb.DesiredIdleTimeout != 0 {
+		if err := albelbv2.ELBV2svc.SetIdleTimeout(lb.Current.LoadBalancerArn, lb.DesiredIdleTimeout); err != nil {
+			rOpts.Eventf(api.EventTypeWarning, "ERROR", "%s tag modification failed: %s", *lb.Current.LoadBalancerName, err.Error())
+			lb.logger.Errorf("Failed ELBV2 (ALB) tag modification: %s", err.Error())
+			return err
+		}
+		lb.CurrentIdleTimeout = lb.DesiredIdleTimeout
+		rOpts.Eventf(api.EventTypeNormal, "CREATE", "Set ALB's connection idle timeout to %d", lb.CurrentIdleTimeout)
+		lb.logger.Infof("Connection idle timeout set to %d", lb.CurrentIdleTimeout)
+	}
 
 	// when a desired managed sg was present, it was used and should be set as the new CurrentManagedSG.
 	if lb.DesiredManagedSG != nil {
@@ -371,6 +433,20 @@ func (lb *LoadBalancer) modify(rOpts *ReconcileOptions) error {
 				log.Prettify(lb.CurrentTags))
 		}
 
+		// Modify Connection Idle Timeout
+		if needsMod&connectionIdleTimeoutModified != 0 {
+			if lb.DesiredIdleTimeout != 0 {
+				if err := albelbv2.ELBV2svc.SetIdleTimeout(lb.Current.LoadBalancerArn, lb.DesiredIdleTimeout); err != nil {
+					rOpts.Eventf(api.EventTypeWarning, "ERROR", "%s tag modification failed: %s", *lb.Current.LoadBalancerName, err.Error())
+					lb.logger.Errorf("Failed ELBV2 (ALB) tag modification: %s", err.Error())
+					return err
+				}
+				lb.CurrentIdleTimeout = lb.DesiredIdleTimeout
+				rOpts.Eventf(api.EventTypeNormal, "MODIFY", "Connection idle timeout updated to %d", lb.CurrentIdleTimeout)
+				lb.logger.Infof("Connection idle timeout updated to %d", lb.CurrentIdleTimeout)
+			}
+		}
+
 	} else {
 		// Modification is needed, but required full replacement of ALB.
 		lb.logger.Infof("Start ELBV2 full modification (delete and create).")
@@ -411,20 +487,42 @@ func (lb *LoadBalancer) delete(rOpts *ReconcileOptions) error {
 			rOpts.Eventf(api.EventTypeWarning, "WARN", "Failed disassociating sgs from instances: %s", err.Error())
 			lb.logger.Warnf("Failed in deletion of managed SG: %s.", err.Error())
 		}
-		if err := ec2.EC2svc.DeleteSecurityGroupByID(lb.CurrentManagedInstanceSG); err != nil {
+		if err := attemptSGDeletion(lb.CurrentManagedInstanceSG); err != nil {
 			rOpts.Eventf(api.EventTypeWarning, "WARN", "Failed deleting %s: %s", *lb.CurrentManagedInstanceSG, err.Error())
-			lb.logger.Warnf("Failed in deletion of managed SG: %s.", err.Error())
+			lb.logger.Warnf("Failed in deletion of managed SG: %s. Continuing remaining deletions, may leave orphaned SGs in AWS.", err.Error())
+		} else { // only attempt this SG deletion if the above passed, otherwise it will fail due to depenencies.
+			if err := attemptSGDeletion(lb.CurrentManagedSG); err != nil {
+				rOpts.Eventf(api.EventTypeWarning, "WARN", "Failed deleting %s: %s", *lb.CurrentManagedSG, err.Error())
+				lb.logger.Warnf("Failed in deletion of managed SG: %s. Continuing remaining deletions, may leave orphaned SG in AWS.", err.Error())
+			}
 		}
-		// TODO: Be more resilent in ec2.go -- for now this is just a quick fix
-		time.Sleep(10 * time.Second)
-		if err := ec2.EC2svc.DeleteSecurityGroupByID(lb.CurrentManagedSG); err != nil {
-			rOpts.Eventf(api.EventTypeWarning, "WARN", "Failed deleting %s: %s", *lb.CurrentManagedSG, err.Error())
-			lb.logger.Warnf("Failed in deletion of managed SG: %s.", err.Error())
-		}
+
 	}
 
 	lb.Deleted = true
 	return nil
+}
+
+// attemptSGDeletion makes a few attempts to remove an SG. If it cannot due to DependencyViolations
+// it reattempts in 10 seconds. For up to 2 minutes.
+func attemptSGDeletion(sg *string) error {
+	// Possible a DependencyViolation will be seen, make a few attempts incase
+	var rErr error
+	for i := 0; i < 6; i++ {
+		time.Sleep(20 * time.Second)
+		if err := ec2.EC2svc.DeleteSecurityGroupByID(sg); err != nil {
+			rErr = err
+			if aerr, ok := err.(awserr.Error); ok {
+				if aerr.Code() == "DependencyViolation" {
+					continue
+				}
+			}
+		} else { // success, no AWS err occured
+			rErr = nil
+		}
+		break
+	}
+	return rErr
 }
 
 // needsModification returns if a LB needs to be modified and if it can be modified in place
@@ -451,10 +549,11 @@ func (lb *LoadBalancer) needsModification() (loadBalancerChange, bool) {
 		changes |= subnetsModified
 	}
 
-	if lb.CurrentPorts != nil {
+	if lb.CurrentPorts != nil && lb.CurrentManagedSG != nil {
 		sort.Sort(lb.CurrentPorts)
 		sort.Sort(lb.DesiredPorts)
 		if !reflect.DeepEqual(lb.DesiredPorts, lb.CurrentPorts) {
+
 			changes |= managedSecurityGroupsModified
 		}
 	} else {
@@ -471,6 +570,10 @@ func (lb *LoadBalancer) needsModification() (loadBalancerChange, bool) {
 	sort.Sort(lb.DesiredTags)
 	if log.Prettify(lb.CurrentTags) != log.Prettify(lb.DesiredTags) {
 		changes |= tagsModified
+	}
+
+	if lb.DesiredIdleTimeout > 0 && lb.CurrentIdleTimeout != lb.DesiredIdleTimeout {
+		changes |= connectionIdleTimeoutModified
 	}
 
 	return changes, true

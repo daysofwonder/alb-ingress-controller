@@ -2,10 +2,13 @@ package elbv2
 
 import (
 	"context"
+	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/elbv2"
@@ -27,6 +30,7 @@ const (
 type ELBV2API interface {
 	elbv2iface.ELBV2API
 	ClusterLoadBalancers(clusterName *string) ([]*elbv2.LoadBalancer, error)
+	SetIdleTimeout(arn *string, timeout int64) error
 	UpdateTags(arn *string, old util.Tags, new util.Tags) error
 	RemoveTargetGroup(in elbv2.DeleteTargetGroupInput) error
 	DescribeTagsForArn(arn *string) (util.Tags, error)
@@ -34,6 +38,7 @@ type ELBV2API interface {
 	RemoveListener(in elbv2.DeleteListenerInput) error
 	DescribeTargetGroupsForLoadBalancer(loadBalancerArn *string) ([]*elbv2.TargetGroup, error)
 	DescribeListenersForLoadBalancer(loadBalancerArn *string) ([]*elbv2.Listener, error)
+	Status() func() error
 }
 
 // ELBV2 is our extension to AWS's elbv2.ELBV2
@@ -175,6 +180,30 @@ func (e *ELBV2) DescribeTargetGroupTargetsForArn(arn *string) (util.AWSStringSli
 	return targets, err
 }
 
+// SetIdleTimeout attempts to update an ELBV2's connection idle timeout setting. It must
+// be passed a timeout in the range of 1-3600. If it fails to update, // an error will be returned.
+func (e *ELBV2) SetIdleTimeout(arn *string, timeout int64) error {
+	// aws only accepts a range of 1-3600 seconds
+	if timeout < 1 || timeout > 3600 {
+		return fmt.Errorf("Invalid set idle timeout provided. Must be within 1-3600 seconds. No modification will be attempted. Was: %d", timeout)
+	}
+
+	in := &elbv2.ModifyLoadBalancerAttributesInput{
+		LoadBalancerArn: arn,
+		Attributes: []*elbv2.LoadBalancerAttribute{
+			{
+				Key:   aws.String(util.IdleTimeoutKey),
+				Value: aws.String(strconv.Itoa(int(timeout)))},
+		},
+	}
+
+	if _, err := e.ModifyLoadBalancerAttributes(in); err != nil {
+		return fmt.Errorf("Failed to create ELBV2 (ALB): %s", err.Error())
+	}
+
+	return nil
+}
+
 // UpdateTags compares the new (desired) tags against the old (current) tags. It then adds and
 // removes tags as needed.
 func (e *ELBV2) UpdateTags(arn *string, old util.Tags, new util.Tags) error {
@@ -219,4 +248,17 @@ func (e *ELBV2) UpdateTags(arn *string, old util.Tags, new util.Tags) error {
 	}
 
 	return nil
+}
+
+// Status validates ELBV2 connectivity
+func (e *ELBV2) Status() func() error {
+	return func() error {
+		in := &elbv2.DescribeLoadBalancersInput{}
+		in.SetPageSize(1)
+
+		if _, err := e.DescribeLoadBalancers(in); err != nil {
+			return err
+		}
+		return nil
+	}
 }
