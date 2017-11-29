@@ -624,7 +624,11 @@ func (lb *LoadBalancer) needsModification() (loadBalancerChange, bool) {
 		changes |= connectionIdleTimeoutModified
 	}
 
-	if lb.DesiredWafAcl != lb.CurrentWafAcl || (lb.CurrentWafAcl != nil && lb.DesiredWafAcl != nil && *lb.CurrentWafAcl == *lb.DesiredWafAcl) {
+	lb.logger.Debugf("%s checking if WAF needs update (old: %v, new: %v)", *lb.Current.LoadBalancerName, lb.CurrentWafAcl, lb.DesiredWafAcl)
+	if lb.DesiredWafAcl != lb.CurrentWafAcl || (lb.CurrentWafAcl != nil && lb.DesiredWafAcl != nil && *lb.CurrentWafAcl != *lb.DesiredWafAcl) {
+		if lb.CurrentWafAcl != nil && lb.DesiredWafAcl != nil {
+			lb.logger.Debugf("%s WAF needs update: %s != %s", *lb.Current.LoadBalancerName, *lb.CurrentWafAcl, *lb.DesiredWafAcl)
+		}
 		changes |= wafAssociationModified
 	}
 	return changes, true
