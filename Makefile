@@ -19,9 +19,9 @@
 
 all: container
 
-TAG?=1.0-alpha.7
+TAG?=1.0-alpha.7-dow02
 BUILD=$(shell git log --pretty=format:'%h' -n 1)
-PREFIX?=quay.io/coreos/alb-ingress-controller
+PREFIX?=daysofwonder/alb-ingress-controller
 ARCH?=amd64
 TEMP_DIR:=$(shell mktemp -d)
 LDFLAGS=-X github.com/coreos/alb-ingress-controller/pkg/controller.build=git-$(BUILD) -X github.com/coreos/alb-ingress-controller/pkg/controller.release=$(TAG)
@@ -32,7 +32,7 @@ server: cmd/main.go pkg/*/*.go pkg/*/*/*.go
 container: server
 	docker build --pull -t $(PREFIX):$(TAG) .
 
-push: push
+push: container
 	docker push $(PREFIX):$(TAG)
 
 clean:
