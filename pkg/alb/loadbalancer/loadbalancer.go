@@ -155,7 +155,7 @@ func NewCurrentLoadBalancer(o *NewCurrentLoadBalancerOptions) (*LoadBalancer, er
 		return nil, fmt.Errorf("Loadbalancer error when accessing resource WAF: %s", err.Error())
 	}
 	var wafACLId *string
-	if wafResult == nil {
+	if wafResult != nil {
 		wafACLId = wafResult.WebACLId
 	}
 
@@ -481,8 +481,8 @@ func (lb *LoadBalancer) modify(rOpts *ReconcileOptions) error {
 				}
 			} else if lb.CurrentWafAcl != nil {
 				if _, err := waf.WAFRegionalsvc.Disassociate(lb.Current.LoadBalancerArn); err != nil {
-					rOpts.Eventf(api.EventTypeWarning, "ERROR", "%s Waf association failed: %s", *lb.Current.LoadBalancerName, err.Error())
-					lb.logger.Errorf("Failed ELBV2 (ALB) Waf association failed: %s", err.Error())
+					rOpts.Eventf(api.EventTypeWarning, "ERROR", "%s Waf disassociation failed: %s", *lb.Current.LoadBalancerName, err.Error())
+					lb.logger.Errorf("Failed ELBV2 (ALB) Waf disassociation failed: %s", err.Error())
 				} else {
 					lb.CurrentWafAcl = lb.DesiredWafAcl
 					rOpts.Eventf(api.EventTypeNormal, "MODIFY", "WAF Disassociated")

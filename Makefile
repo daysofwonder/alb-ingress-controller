@@ -19,7 +19,7 @@
 
 all: container
 
-TAG?=1.0-alpha.7-dow04
+TAG?=1.0-alpha.7-dow06
 BUILD=$(shell git log --pretty=format:'%h' -n 1)
 PREFIX?=daysofwonder/alb-ingress-controller
 ARCH?=amd64
