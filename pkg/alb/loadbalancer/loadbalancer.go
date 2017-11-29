@@ -625,7 +625,8 @@ func (lb *LoadBalancer) needsModification() (loadBalancerChange, bool) {
 	}
 
 	lb.logger.Debugf("%s checking if WAF needs update (old: %v, new: %v)", *lb.Current.LoadBalancerName, lb.CurrentWafAcl, lb.DesiredWafAcl)
-	if lb.DesiredWafAcl != lb.CurrentWafAcl || (lb.CurrentWafAcl != nil && lb.DesiredWafAcl != nil && *lb.CurrentWafAcl != *lb.DesiredWafAcl) {
+	if lb.DesiredWafAcl != nil && lb.CurrentWafAcl == nil || lb.DesiredWafAcl == nil && lb.CurrentWafAcl != nil ||
+		(lb.CurrentWafAcl != nil && lb.DesiredWafAcl != nil && *lb.CurrentWafAcl != *lb.DesiredWafAcl) {
 		if lb.CurrentWafAcl != nil && lb.DesiredWafAcl != nil {
 			lb.logger.Debugf("%s WAF needs update: %s != %s", *lb.Current.LoadBalancerName, *lb.CurrentWafAcl, *lb.DesiredWafAcl)
 		}
