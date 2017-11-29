@@ -15,13 +15,13 @@ import (
 	"github.com/coreos/alb-ingress-controller/pkg/alb/listeners"
 	"github.com/coreos/alb-ingress-controller/pkg/alb/targetgroup"
 	"github.com/coreos/alb-ingress-controller/pkg/alb/targetgroups"
-	"github.com/coreos/alb-ingress-controller/pkg/alb/wafacl"
 	"github.com/coreos/alb-ingress-controller/pkg/annotations"
 	"github.com/coreos/alb-ingress-controller/pkg/aws/ec2"
 	albelbv2 "github.com/coreos/alb-ingress-controller/pkg/aws/elbv2"
 	"github.com/coreos/alb-ingress-controller/pkg/util/log"
 	util "github.com/coreos/alb-ingress-controller/pkg/util/types"
 	api "k8s.io/api/core/v1"
+	"github.com/coreos/alb-ingress-controller/pkg/aws/waf"
 )
 
 // LoadBalancer contains the overarching configuration for the ALB
@@ -37,8 +37,8 @@ type LoadBalancer struct {
 	DesiredTags              util.Tags
 	CurrentPorts             portList
 	DesiredPorts             portList
-	CurrentWafAcl            *wafacl.WafAcl
-	DesiredWafAcl            *wafacl.WafAcl
+	CurrentWafAcl            *string
+	DesiredWafAcl            *string
 	CurrentManagedSG         *string
 	DesiredManagedSG         *string
 	CurrentManagedInstanceSG *string
@@ -56,6 +56,7 @@ const (
 	schemeModified
 	managedSecurityGroupsModified
 	connectionIdleTimeoutModified
+	wafAssociationModified
 )
 
 type NewDesiredLoadBalancerOptions struct {
@@ -84,6 +85,7 @@ func NewDesiredLoadBalancer(o *NewDesiredLoadBalancerOptions) *LoadBalancer {
 		ID:                 name,
 		DesiredTags:        o.Tags,
 		DesiredIdleTimeout: o.Annotations.ConnectionIdleTimeout,
+		DesiredWafAcl:      o.Annotations.WafAclId,
 		Desired: &elbv2.LoadBalancer{
 			AvailabilityZones: o.Annotations.Subnets.AsAvailabilityZones(),
 			LoadBalancerName:  aws.String(name),
@@ -108,6 +110,7 @@ func NewDesiredLoadBalancer(o *NewDesiredLoadBalancerOptions) *LoadBalancer {
 		o.ExistingLoadBalancer.Desired = newLoadBalancer.Desired
 		o.ExistingLoadBalancer.DesiredTags = newLoadBalancer.DesiredTags
 		o.ExistingLoadBalancer.DesiredIdleTimeout = newLoadBalancer.DesiredIdleTimeout
+		o.ExistingLoadBalancer.DesiredWafAcl = newLoadBalancer.DesiredWafAcl
 		if len(o.ExistingLoadBalancer.Desired.SecurityGroups) == 0 {
 			o.ExistingLoadBalancer.DesiredPorts = lsps
 		}
@@ -147,6 +150,15 @@ func NewCurrentLoadBalancer(o *NewCurrentLoadBalancerOptions) (*LoadBalancer, er
 			"Expecting %s but was %s.", name, *o.LoadBalancer.LoadBalancerName)
 	}
 
+	wafResult, err := waf.WAFRegionalsvc.GetWebACLSummary(o.LoadBalancer.LoadBalancerArn)
+	if err != nil {
+		return nil, fmt.Errorf("Loadbalancer error when accessing resource WAF: %s", err.Error())
+	}
+	var wafACLId *string
+	if wafResult == nil {
+		wafACLId = wafResult.WebACLId
+	}
+
 	return &LoadBalancer{
 		ID:                       name,
 		CurrentTags:              o.Tags,
@@ -156,6 +168,7 @@ func NewCurrentLoadBalancer(o *NewCurrentLoadBalancerOptions) (*LoadBalancer, er
 		CurrentPorts:             o.ManagedSGPorts,
 		CurrentManagedInstanceSG: o.ManagedInstanceSG,
 		CurrentIdleTimeout:       o.ConnectionIdleTimeout,
+		CurrentWafAcl: 			  wafACLId,
 	}, nil
 }
 
@@ -360,6 +373,15 @@ func (lb *LoadBalancer) create(rOpts *ReconcileOptions) error {
 		lb.logger.Infof("Connection idle timeout set to %d", lb.CurrentIdleTimeout)
 	}
 
+	if lb.DesiredWafAcl != nil {
+		_, err = waf.WAFRegionalsvc.Associate(lb.Current.LoadBalancerArn, lb.DesiredWafAcl)
+		if err != nil {
+			rOpts.Eventf(api.EventTypeWarning, "ERROR", "%s WAF (%s) association failed: %s", *lb.Current.LoadBalancerName, lb.DesiredWafAcl, err.Error())
+			lb.logger.Errorf("Failed ELBV2 (ALB) WAF (%s) association: %s", lb.DesiredWafAcl, err.Error())
+			return err
+		}
+	}
+
 	// when a desired managed sg was present, it was used and should be set as the new CurrentManagedSG.
 	if lb.DesiredManagedSG != nil {
 		lb.CurrentManagedSG = lb.DesiredManagedSG
@@ -447,6 +469,28 @@ func (lb *LoadBalancer) modify(rOpts *ReconcileOptions) error {
 			}
 		}
 
+		if needsMod&wafAssociationModified != 0 {
+			if lb.DesiredWafAcl != nil {
+				if _, err := waf.WAFRegionalsvc.Associate(lb.Current.LoadBalancerArn, lb.DesiredWafAcl); err != nil {
+					rOpts.Eventf(api.EventTypeWarning, "ERROR", "%s Waf (%s) association failed: %s", *lb.Current.LoadBalancerName, *lb.DesiredWafAcl, err.Error())
+					lb.logger.Errorf("Failed ELBV2 (ALB) Waf (%s) association failed: %s", *lb.DesiredWafAcl, err.Error())
+				} else {
+					lb.CurrentWafAcl = lb.DesiredWafAcl
+					rOpts.Eventf(api.EventTypeNormal, "MODIFY", "WAF Association updated to %s", *lb.DesiredWafAcl)
+					lb.logger.Infof("WAF Association updated %s", *lb.DesiredWafAcl)
+				}
+			} else if lb.CurrentWafAcl != nil {
+				if _, err := waf.WAFRegionalsvc.Disassociate(lb.Current.LoadBalancerArn); err != nil {
+					rOpts.Eventf(api.EventTypeWarning, "ERROR", "%s Waf association failed: %s", *lb.Current.LoadBalancerName, err.Error())
+					lb.logger.Errorf("Failed ELBV2 (ALB) Waf association failed: %s", err.Error())
+				} else {
+					lb.CurrentWafAcl = lb.DesiredWafAcl
+					rOpts.Eventf(api.EventTypeNormal, "MODIFY", "WAF Disassociated")
+					lb.logger.Infof("WAF Disassociated")
+				}
+			}
+		}
+
 	} else {
 		// Modification is needed, but required full replacement of ALB.
 		lb.logger.Infof("Start ELBV2 full modification (delete and create).")
@@ -466,6 +510,10 @@ func (lb *LoadBalancer) modify(rOpts *ReconcileOptions) error {
 
 // delete Deletes the load balancer from AWS.
 func (lb *LoadBalancer) delete(rOpts *ReconcileOptions) error {
+
+	// we need to disassociate the WAF before deletion
+	waf.WAFRegionalsvc.Disassociate(lb.Current.LoadBalancerArn)
+
 	in := &elbv2.DeleteLoadBalancerInput{
 		LoadBalancerArn: lb.Current.LoadBalancerArn,
 	}
@@ -576,6 +624,9 @@ func (lb *LoadBalancer) needsModification() (loadBalancerChange, bool) {
 		changes |= connectionIdleTimeoutModified
 	}
 
+	if lb.DesiredWafAcl != lb.CurrentWafAcl || (lb.CurrentWafAcl != nil && lb.DesiredWafAcl != nil && *lb.CurrentWafAcl == *lb.DesiredWafAcl) {
+		changes |= wafAssociationModified
+	}
 	return changes, true
 }
 
@@ -584,6 +635,7 @@ func (l *LoadBalancer) StripDesiredState() {
 	l.Desired = nil
 	l.DesiredPorts = nil
 	l.DesiredManagedSG = nil
+	l.DesiredWafAcl = nil
 	if l.Listeners != nil {
 		l.Listeners.StripDesiredState()
 	}
