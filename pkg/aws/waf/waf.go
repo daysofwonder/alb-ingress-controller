@@ -26,16 +26,16 @@ func NewWAFRegional(awsSession *session.Session) {
 }
 
 // WafAclExists checks whether the provided ID existing in AWS.
-func (a *WAFRegional) WafAclExists(web_acl_id *string) bool {
+func (a *WAFRegional) WafAclExists(web_acl_id *string) (bool, error) {
 	params := &waf.GetWebACLInput{
 		WebACLId: web_acl_id,
 	}
 	_, err := a.Svc.GetWebACL(params)
 
 	if err != nil {
-		return false
+		return false, err
 	}
-	return true
+	return true, nil
 }
 
 // GetWebACLSummary return associated summary for resource.
